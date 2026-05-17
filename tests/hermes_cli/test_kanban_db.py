@@ -1530,3 +1530,208 @@ def test_task_dict_survives_corrupt_created_at(tmp_path, monkeypatch):
         conn.close()
     age = kb.task_age(task)
     assert age["created_age_seconds"] is None
+
+
+# ---------------------------------------------------------------------------
+# Workspace / tmux cleanup on task completion
+# ---------------------------------------------------------------------------
+
+def test_cleanup_workspace_removes_scratch_dir(kanban_home, tmp_path, monkeypatch):
+    """complete_task must remove the scratch workspace directory."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="swarm1", workspace_kind="scratch")
+        # Create a real scratch workspace directory on disk.
+        ws_root = kb.workspaces_root()
+        ws_root.mkdir(parents=True, exist_ok=True)
+        ws_dir = ws_root / t
+        ws_dir.mkdir()
+        (ws_dir / "marker.txt").write_text("alive")
+
+        # workspace_path is not auto-populated by create_task; set it explicitly
+        # so _cleanup_workspace has a real path to remove.
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ? WHERE id = ?", (str(ws_dir), t)
+        )
+        conn.commit()
+
+        assert ws_dir.is_dir(), "workspace must exist before complete_task"
+
+        kb.complete_task(conn, t, result="done")
+
+    # Workspace directory must be gone after completion.
+    assert not ws_dir.exists(), (
+        f"scratch workspace {ws_dir} should have been removed by complete_task"
+    )
+
+
+def test_cleanup_workspace_ignores_worktree_kind(kanban_home, tmp_path, monkeypatch):
+    """complete_task must NOT remove worktree workspaces."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="git work", assignee="swarm1", workspace_kind="worktree")
+        ws_root = kb.workspaces_root()
+        ws_root.mkdir(parents=True, exist_ok=True)
+        ws_dir = ws_root / t
+        ws_dir.mkdir()
+        (ws_dir / "README.md").write_text("keep me")
+
+        kb.complete_task(conn, t, result="done")
+
+    # worktree workspaces are intentionally preserved.
+    assert ws_dir.is_dir(), "worktree workspace must NOT be removed"
+
+
+def test_cleanup_workspace_ignores_dir_kind(kanban_home, tmp_path, monkeypatch):
+    """complete_task must NOT remove named-dir workspaces."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="named dir", assignee="swarm1", workspace_kind="dir")
+        ws_root = kb.workspaces_root()
+        ws_root.mkdir(parents=True, exist_ok=True)
+        ws_dir = ws_root / t
+        ws_dir.mkdir()
+        (ws_dir / "keep.txt").write_text("keep")
+
+        kb.complete_task(conn, t, result="done")
+
+    assert ws_dir.is_dir(), "named dir workspace must NOT be removed"
+
+
+def test_cleanup_workspace_idempotent_when_no_workspace_path(kanban_home):
+    """complete_task with no workspace_path set must not error."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="no workspace", assignee="swarm1")
+        # workspace_kind defaults to scratch but workspace_path is None
+        result = kb.complete_task(conn, t, result="done")
+    assert result is True
+
+
+def test_cleanup_workspace_idempotent_when_dir_already_gone(kanban_home):
+    """complete_task must not error if the workspace directory was already removed."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="ghost ws", assignee="swarm1")
+        # Set workspace_path to a non-existent directory
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+            ("/nonexistent/path/for/test", t),
+        )
+        conn.commit()
+
+        # Must not raise — _cleanup_workspace is best-effort.
+        result = kb.complete_task(conn, t, result="done")
+    assert result is True
+
+
+def test_cleanup_worker_tmux_does_not_kill_active_session(kanban_home, monkeypatch):
+    """tmux session with a live pane must not be killed."""
+    import subprocess
+    import hermes_cli.kanban_db as _kb
+
+    active_calls: list = []
+
+    def fake_run(cmd, *args, **kwargs):
+        active_calls.append(cmd)
+        # Simulate a live pane (pane_dead == 0)
+        r = type("R", (), {"stdout": "0", "returncode": 0})()
+        return r
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="live worker", assignee="swarm1")
+
+    # Calling the cleanup function directly with a live tmux session.
+    _kb._cleanup_worker_tmux(conn, t)
+
+    # tmux kill-session must NOT have been called for an active session.
+    kill_calls = [c for c in active_calls if "kill-session" in c]
+    assert kill_calls == [], f"kill-session must not run for active session: {kill_calls}"
+
+
+def test_cleanup_worker_tmux_kills_dead_session(kanban_home, monkeypatch):
+    """tmux session with a dead pane (pane_dead == 1) must be killed."""
+    import subprocess
+    import hermes_cli.kanban_db as _kb
+
+    killed_sessions: list = []
+
+    def fake_run(cmd, *args, **kwargs):
+        if "kill-session" in cmd:
+            killed_sessions.append(cmd)
+        # Return pane_dead == 1 to indicate dead session
+        r = type("R", (), {"stdout": "1", "returncode": 0})()
+        return r
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="dead worker", assignee="swarm1")
+
+    _kb._cleanup_worker_tmux(conn, t)
+
+    assert len(killed_sessions) == 1, f"expected one kill-session call, got: {killed_sessions}"
+    assert "swarm-swarm1" in killed_sessions[0], (
+        f"expected swarm-swarm1 session to be killed, got: {killed_sessions}"
+    )
+
+
+def test_cleanup_worker_tmux_no_assignee_is_noop(kanban_home):
+    """Task with no assignee must not attempt any tmux operation."""
+    import subprocess
+    import hermes_cli.kanban_db as _kb
+
+    calls_before: int = 0
+
+    def count_calls(cmd, *args, **kwargs):
+        nonlocal calls_before
+        calls_before += 1
+        return type("R", (), {"stdout": "1", "returncode": 0})()
+
+    original_run = subprocess.run
+    subprocess.run = count_calls
+    try:
+        with kb.connect() as conn:
+            t = kb.create_task(conn, title="unassigned", assignee=None)
+
+        calls_before = 0
+        _kb._cleanup_worker_tmux(conn, t)
+
+        assert calls_before == 0, (
+            "tmux must not be invoked when task has no assignee"
+        )
+    finally:
+        subprocess.run = original_run
+
+
+def test_cleanup_worker_tmux_session_not_found_is_noop(kanban_home, monkeypatch):
+    """tmux session that doesn't exist must not raise."""
+    import subprocess
+    import hermes_cli.kanban_db as _kb
+
+    kill_calls: list = []
+
+    def fake_run(cmd, *args, **kwargs):
+        if "list-panes" in cmd:
+            # No such session — return exit code 1
+            r = type("R", (), {"stdout": "", "returncode": 1})()
+        else:
+            kill_calls.append(cmd)
+            r = type("R", (), {"stdout": "", "returncode": 0})()
+        return r
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="no session", assignee="swarm1")
+
+    # Must not raise even though session doesn't exist.
+    _kb._cleanup_worker_tmux(conn, t)
+
+    assert kill_calls == [], f"kill-session must not be called when session absent: {kill_calls}"
